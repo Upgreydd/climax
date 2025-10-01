@@ -2,10 +2,86 @@ import argparse
 from functools import wraps
 from functools import partial
 import getpass
+import json
+import os
+import sys
 from gettext import gettext as _
 
 
-class _CopiedArgumentParser(argparse.ArgumentParser):
+def _extract_parser_info(parser):
+    """Extract information from an ArgumentParser in JSON-serializable format."""
+    info = {
+        'prog': parser.prog,
+        'description': parser.description,
+        'epilog': parser.epilog,
+        'usage': parser.format_usage().strip() if hasattr(parser, 'format_usage') else None,
+        'arguments': [],
+        'subcommands': {}
+    }
+
+    # Extract arguments/options
+    for action in parser._actions:
+        # Skip help action and subparser actions
+        if (action.option_strings == ['-h', '--help'] or
+            isinstance(action, argparse._SubParsersAction)):
+            continue
+
+        arg_info = {
+            'dest': action.dest,
+            'option_strings': list(action.option_strings) if action.option_strings else [],
+            'nargs': action.nargs,
+            'const': action.const,
+            'default': action.default,
+            'type': action.type.__name__ if action.type and hasattr(action.type, '__name__') else str(action.type) if action.type else None,
+            'choices': list(action.choices) if action.choices else None,
+            'help': action.help,
+            'required': getattr(action, 'required', False),
+            'metavar': action.metavar
+        }
+
+        # Handle special cases for serialization
+        if arg_info['default'] is argparse.SUPPRESS:
+            arg_info['default'] = None
+        if callable(arg_info['const']):
+            arg_info['const'] = str(arg_info['const'])
+
+        info['arguments'].append(arg_info)
+
+    # Extract subcommands recursively
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for choice, subparser in action.choices.items():
+                info['subcommands'][choice] = _extract_parser_info(subparser)
+
+    return info
+
+
+def _should_output_json():
+    """Check if CLIMAX_JSON environment variable is set to true."""
+    return os.environ.get('CLIMAX_JSON', '').lower() in ('true', '1', 'yes', 'on')
+
+
+def _output_json_help(parser):
+    """Output parser structure as JSON and exit."""
+    json_info = _extract_parser_info(parser)
+    print(json.dumps(json_info, indent=2, default=str))
+    sys.exit(0)
+
+
+class _JsonCapableArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that can output JSON instead of help when CLIMAX_JSON is set."""
+    def format_help(self):
+        if _should_output_json():
+            _output_json_help(self)
+        return super(_JsonCapableArgumentParser, self).format_help()
+
+    def print_help(self, file=None):
+        if _should_output_json():
+            _output_json_help(self)
+        super(_JsonCapableArgumentParser, self).print_help(file)
+
+
+class _CopiedArgumentParser(_JsonCapableArgumentParser):
     """ArgumentParser subclass that copies everything from an existing
     ArgumentParser object. Used as a helper when building groups with
     sub-commands.
@@ -22,7 +98,7 @@ class PasswordPrompt(argparse.Action):
         kwargs['nargs'] = 0
         super(PasswordPrompt, self).__init__(*args, **kwargs)
 
-    def __call__(self, parser, namespace, values, option_string):
+    def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, getpass.getpass())
 
 
@@ -46,7 +122,7 @@ def command(*args, **kwargs):
             kwargs['parents'] = [p.parser for p in kwargs['parents']]
 
         if 'parser' not in kwargs:
-            f.parser = argparse.ArgumentParser(*args, **kwargs)
+            f.parser = _JsonCapableArgumentParser(*args, **kwargs)
         else:
             f.parser = kwargs['parser']
         f.climax = 'parser' not in kwargs
@@ -56,10 +132,9 @@ def command(*args, **kwargs):
 
         @wraps(f)
         def wrapper(args=None):
-            kwargs = f.parser.parse_args(args)
-            return f(**vars(kwargs))
+            parsed_args = f.parser.parse_args(args)
+            return f(**vars(parsed_args))
 
-        wrapper.func = f
         return wrapper
     return decorator
 
@@ -151,8 +226,9 @@ def group(*args, **kwargs):
             for p in kwargs['parents']:
                 f._argnames += p._argnames if hasattr(p, '_argnames') else []
             kwargs['parents'] = [p.parser for p in kwargs['parents']]
-        f.parser = argparse.ArgumentParser(*args, **kwargs)
+        f.parser = _JsonCapableArgumentParser(*args, **kwargs)
         f.climax = True
+
         for arg in getattr(f, '_arguments', []):
             f.parser.add_argument(*arg[0], **arg[1])
         f._subparsers = f.parser.add_subparsers()
@@ -233,7 +309,7 @@ def _get_dest(*args, **kwargs):  # pragma: no cover
         dest = dest_option_string.lstrip(prefix_chars)
         if not dest:
             msg = _('dest= is required for options like %r')
-            raise ValueError(msg % option_string)
+            raise ValueError(msg % dest_option_string)
         dest = dest.replace('-', '_')
 
     # return the updated dest name
